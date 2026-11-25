@@ -1,0 +1,44 @@
+server:
+  port: 8080
+
+spring:
+  cache:
+    type: caffeine
+    cache-names: projects, progress, contributions, dashboard
+    caffeine:
+      spec: maximumSize=100,expireAfterWrite=300s
+
+github:
+  owner: ${GITHUB_OWNER:}
+  token: ${GITHUB_TOKEN:}
+  repositories: ${GITHUB_REPOSITORIES:}
+
+gemini:
+  enabled: ${GEMINI_ENABLED:false}
+  access-key: ${AI_ACCESS_KEY:}
+  api-key: ${GEMINI_API_KEY:}
+  model: ${GEMINI_MODEL:gemini-3.1-flash-lite}
+  embedding-model: ${GEMINI_EMBEDDING_MODEL:gemini-embedding-001}
+
+  project-id: ${GEMINI_PROJECT_ID:}
+  project-number: ${GEMINI_PROJECT_NUMBER:}
+
+  base-url: https://generativelanguage.googleapis.com/v1beta
+
+  generation:
+    temperature: 0.3
+    max-output-tokens: 1024
+
+  rag:
+    chunk-size: 500
+    chunk-overlap: 100
+    top-k: 3
+
+  rate-limit:
+    enabled: true
+    requests-per-minute: 3
+    requests-per-day: 20
+
+  timeout:
+    connect-seconds: 10
+    read-seconds: 60

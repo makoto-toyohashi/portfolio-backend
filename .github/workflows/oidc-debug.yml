@@ -9,28 +9,17 @@ permissions:
 
 jobs:
   debug:
+    name: AWS Authentication Test
     runs-on: ubuntu-latest
 
     steps:
-      # OIDCトークンの認証情報を確認する
-      - name: Inspect OIDC claims
-        uses: actions/github-script@v8
+      # OIDCを利用してAWSの一時認証情報を取得
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
         with:
-          script: |
-            const token = await core.getIDToken("sts.amazonaws.com");
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-            const claims = JSON.parse(
-              Buffer.from(
-                token.split(".")[1],
-                "base64url"
-              ).toString("utf8")
-            );
-
-            console.log(JSON.stringify({
-              iss: claims.iss,
-              aud: claims.aud,
-              sub: claims.sub,
-              repository: claims.repository,
-              ref: claims.ref,
-              event_name: claims.event_name
-            }, null, 2));
+      # IAMロールによる認証が成功したことを確認
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity

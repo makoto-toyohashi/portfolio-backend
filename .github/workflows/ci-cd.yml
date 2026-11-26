@@ -60,7 +60,6 @@ jobs:
   deploy:
     name: Deploy Backend to AWS
 
-    # CIが成功した場合のみ実行
     needs: ci
 
     # mainブランチへのPushまたは手動実行のみ
@@ -86,39 +85,49 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION }}
       EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
       SSM_DOCUMENT_NAME: Portfolio-Deploy-Backend
+      PARAMETER_NAME: /portfolio/deploy/backend/pending-sha
       COMMIT_SHA: ${{ github.sha }}
+      AWS_PAGER: ""
 
     steps:
       # ========================================
-      # OIDC認証情報の確認（調査用）
+      # デプロイ対象コミットの確認
       # ========================================
-      - name: Inspect OIDC claims
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const token = await core.getIDToken("sts.amazonaws.com");
+      - name: Validate deployment commit
+        id: validate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
 
-            const claims = JSON.parse(
-              Buffer.from(
-                token.split(".")[1],
-                "base64url"
-              ).toString("utf8")
-            );
+          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid commit SHA."
+            exit 1
+          fi
 
-            console.log(JSON.stringify({
-              iss: claims.iss,
-              aud: claims.aud,
-              sub: claims.sub,
-              repository: claims.repository,
-              repository_id: claims.repository_id,
-              repository_owner_id: claims.repository_owner_id,
-              ref: claims.ref,
-              environment: claims.environment,
-              event_name: claims.event_name
-            }, null, 2));
+          # 現在のmainブランチの最新SHAを取得
+          LATEST_SHA=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+            --jq '.object.sha')
 
+          echo "Target commit: $COMMIT_SHA"
+          echo "Latest commit: $LATEST_SHA"
+
+          # 古いワークフローによる上書きを防止
+          if [[ "$COMMIT_SHA" != "$LATEST_SHA" ]]; then
+            echo "A newer commit exists. Skipping deployment."
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "valid=true" >> "$GITHUB_OUTPUT"
+
+      # ========================================
       # OIDCによるAWS認証
+      # ========================================
       - name: Configure AWS credentials
+        if: steps.validate.outputs.valid == 'true'
         uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
@@ -127,22 +136,76 @@ jobs:
 
       # AWS認証情報の確認
       - name: Verify AWS identity
+        if: steps.validate.outputs.valid == 'true'
         shell: bash
         run: aws sts get-caller-identity
 
-      # SSMを利用したデプロイ実行
-      - name: Execute deployment
-        id: deploy
+      # ========================================
+      # デプロイ対象SHAの保存
+      # ========================================
+      - name: Save deployment commit
+        if: steps.validate.outputs.valid == 'true'
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Target commit: $COMMIT_SHA"
+          aws ssm put-parameter \
+            --name "$PARAMETER_NAME" \
+            --value "$COMMIT_SHA" \
+            --type String \
+            --overwrite \
+            --region "$AWS_REGION"
 
-          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "Invalid commit SHA."
-            exit 1
+          echo "Deployment commit saved: $COMMIT_SHA"
+
+      # ========================================
+      # EC2の稼働状態・時間帯の確認
+      # ========================================
+      - name: Check deployment availability
+        id: availability
+        if: steps.validate.outputs.valid == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # EC2の稼働状態を取得
+          INSTANCE_STATE=$(aws ec2 describe-instances \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --query "Reservations[0].Instances[0].State.Name" \
+            --output text)
+
+          # 日本時間を取得
+          CURRENT_HOUR=$(TZ=Asia/Tokyo date '+%H')
+
+          echo "EC2 state: $INSTANCE_STATE"
+          echo "Current JST hour: $CURRENT_HOUR"
+
+          # EC2停止中・起動中の場合は保留
+          if [[ "$INSTANCE_STATE" != "running" ]]; then
+            echo "EC2 is not running. Deployment deferred."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          # デプロイ可能時間は08:00〜17:59
+          if (( 10#$CURRENT_HOUR < 8 || 10#$CURRENT_HOUR >= 18 )); then
+            echo "Outside deployment hours. Deployment deferred."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      # ========================================
+      # SSMを利用した即時デプロイ
+      # ========================================
+      - name: Execute deployment
+        id: deploy
+        if: steps.availability.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
 
           COMMAND_ID=$(aws ssm send-command \
             --document-name "$SSM_DOCUMENT_NAME" \
@@ -156,8 +219,11 @@ jobs:
           echo "Command ID: $COMMAND_ID"
           echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
 
+      # ========================================
       # デプロイ完了まで待機
+      # ========================================
       - name: Wait for deployment
+        if: steps.deploy.outputs.command_id != ''
         shell: bash
         env:
           COMMAND_ID: ${{ steps.deploy.outputs.command_id }}
@@ -190,6 +256,7 @@ jobs:
 
               *)
                 echo "Deployment failed: $STATUS"
+                echo "Deployment commit remains in Parameter Store."
                 exit 1
                 ;;
             esac
@@ -199,7 +266,9 @@ jobs:
           echo "Deployment timed out."
           exit 1
 
+      # ========================================
       # デプロイ結果の出力
+      # ========================================
       - name: Show deployment result
         if: always() && steps.deploy.outputs.command_id != ''
         shell: bash
@@ -211,3 +280,23 @@ jobs:
             --instance-id "$EC2_INSTANCE_ID" \
             --query "{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}" \
             --output json
+
+      # ========================================
+      # デプロイ保留時の結果出力
+      # ========================================
+      - name: Show deferred deployment
+        if: steps.availability.outputs.available == 'false'
+        shell: bash
+        run: |
+          echo "Deployment has been deferred."
+          echo "Commit: $COMMIT_SHA"
+          echo "Parameter: $PARAMETER_NAME"
+          echo "The EC2 deployment timer will retry."
+
+          {
+            echo "## Backend Deployment Deferred"
+            echo ""
+            echo "- Commit: $COMMIT_SHA"
+            echo "- Status: Pending deployment"
+            echo "- Parameter: $PARAMETER_NAME"
+          } >> "$GITHUB_STEP_SUMMARY"

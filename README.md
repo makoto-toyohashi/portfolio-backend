@@ -8,6 +8,15 @@ GitHub APIによる開発状況の可視化、Google Gemini APIによるAIチャ
 - フロントエンド: https://toyohashi-portfolio.duckdns.org
 - 稼働予定時間: 毎日 08:00〜20:00（JST）
 - バックエンドはEC2内部のループバックアドレス（127.0.0.1:8080）で稼働し、外部へ直接公開しない。
+- 
+## システム全体シーケンス図
+
+<details>
+<summary>シーケンス図を表示する</summary>
+
+![シーケンス図](docs/design/portfolio-sequence.svg)
+
+</details>
 
 ## 技術スタック
 

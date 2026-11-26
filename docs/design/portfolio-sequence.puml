@@ -1,0 +1,372 @@
+@startuml
+ title Portfolio システム全体シーケンス図
+skinparam backgroundColor white
+skinparam monochrome true
+skinparam shadowing false
+skinparam roundcorner 6
+skinparam defaultFontName "Meiryo"
+skinparam defaultFontSize 13
+skinparam ParticipantPadding 12
+skinparam BoxPadding 8
+skinparam sequence {
+ ParticipantBackgroundColor white
+ ParticipantBorderColor #444444
+ LifeLineBorderColor #777777
+ LifeLineBackgroundColor white
+ ArrowColor #333333
+ GroupBackgroundColor white
+ GroupHeaderFontColor black
+ GroupBorderColor #888888
+}
+hide footbox
+autonumber 1
+participant "ブラウザ /\n運用者" as U
+participant "Nginx" as N
+participant "Next.js" as F
+participant "Spring Boot" as B
+participant "Auth0" as A
+participant "GitHub /\nActions" as G
+participant "Gemini" as M
+participant "AWS\n管理サービス" as W
+participant "EC2\n運用処理" as E
+note over U,E
+ 各区間は独立したイベント。上から順に必ず実行されるわけではない。
+ AWS管理サービス列は IAM / STS / SSM / Parameter Store / Scheduler / CloudWatch / SNS / Budgets を集約。
+ EC2運用処理列は systemd / デプロイスクリプト / ローカルファイルを集約。
+end note
+group 01 サイトアクセス
+U -> N : HTTPS GET /（公開ページ）
+activate N
+N -> N : TLS終端・ホスト確認
+opt Basic認証を導入した場合（未実装）
+ alt 認証情報なし・不一致
+ N --> U : 401 / WWW-Authenticate
+ U -> N : Authorization: Basic ...（HTTPS）
+ else 認証成功
+ N -> N : 転送許可
+ end
+end
+N -> F : HTTP GET /（127.0.0.1:3000）
+activate F
+F -> F : セッション確認・ページ描画
+F --> N : HTML / HTTP 200
+ deactivate F
+N --> U : HTML / HTTP 200
+ deactivate N
+end
+group 02 ログイン・登録
+U -> N : GET /auth/login
+activate N
+N -> F : ログイン要求
+activate F
+F -> F : state / nonce / PKCE生成
+F --> N : 302 /authorize
+ deactivate F
+N --> U : 302
+ deactivate N
+U -> A : GET /authorize
+activate A
+A --> U : Universal Login
+U -> A : 資格情報・登録・ソーシャル認証
+opt MFA要求時
+ A --> U : MFAチャレンジ
+ U -> A : MFA応答
+end
+alt 認証成功
+ A --> U : 302 /auth/callback?code=...&state=...
+ U -> N : GET /auth/callback
+ activate N
+ N -> F : callback転送
+ activate F
+ F -> F : state検証
+ F -> A : POST /oauth/token（code / verifier）
+ A --> F : トークンまたはエラー
+ alt トークン検証成功
+ F -> F : IDトークン検証・セッション生成
+ F --> N : Set-Cookie / 302
+ N --> U : Accountへ遷移
+ else 検証失敗
+ F --> N : 認証エラー
+ N --> U : エラー表示
+ end
+ deactivate F
+ deactivate N
+else 認証失敗
+ A --> U : エラー・再入力
+end
+ deactivate A
+end
+group 03 GitHub開発情報取得
+U -> N : GET /works
+activate N
+N -> F : ページ要求
+activate F
+F -> B : GET /api/v1/github/dashboard 等
+activate B
+B -> B : 許可リポジトリ確認・Caffeine参照
+alt キャッシュ有効（5分）
+ B -> B : 保存済み結果取得
+else キャッシュなし
+ loop 必要なリポジトリ・ページ
+ B -> G : REST API（commits / issues / pulls / languages 等）
+ G --> B : JSON / エラー
+ end
+ B -> G : GraphQL contributionCalendar（必要時）
+ G --> B : コントリビューション情報
+ alt 取得成功
+ B -> B : PR除外・Issue集計・言語集計・キャッシュ保存
+ else 外部API失敗
+ B -> B : エラー処理（成功キャッシュは作らない）
+ end
+end
+B --> F : 集計結果またはエラー
+ deactivate B
+F --> N : 描画結果
+ deactivate F
+N --> U : ダッシュボードまたはエラー表示
+ deactivate N
+end
+group 04 AIチャット
+U -> N : POST /api/ai/chat（message / history）
+activate N
+N -> F : Route Handler
+activate F
+F -> F : セッション・リクエスト検証
+alt 未認証・不正要求
+ F --> N : 拒否応答
+else 許可
+ F -> B : POST /api/v1/ai/chat\nX-AI-Key（サーバー間のみ）
+ activate B
+ B -> B : AI有効設定・キー・入力検証
+ alt 検証失敗または利用上限超過
+ B --> F : エラー（制限超過等）
+ else 許可
+ B -> B : ApiBudget（3回/分・20回/日）\n質問最大1000文字・履歴最大6件
+ B -> B : knowledge / RAG チャンク参照
+ opt 埋め込み取得が必要
+ B -> M : embedContent
+ M --> B : ベクトルまたはエラー
+ end
+ B -> B : 関連チャンク選択（最大3件）
+ B -> M : generateContent（質問・履歴・知識）
+ alt 生成成功
+ M --> B : 生成回答
+ B --> F : answer / sources
+ else 外部API失敗
+ M --> B : エラー / タイムアウト
+ B --> F : エラー応答
+ end
+ end
+ deactivate B
+ F --> N : JSON応答
+end
+ deactivate F
+N --> U : 回答またはエラー表示
+ deactivate N
+end
+group 05 週間・月間開発分析
+U -> N : POST /api/ai/analysis/{period}
+activate N
+N -> F : 分析要求
+activate F
+F -> F : セッション・period検証
+alt 許可
+ F -> B : GET /api/v1/ai/analysis/{period}\nX-AI-Key
+ activate B
+ B -> B : キー検証・分析キャッシュ確認（6時間）
+ alt キャッシュなし・生成可能
+ B -> G : 対象期間の開発情報取得
+ G --> B : コミット・Issue・PR等
+ B -> M : generateContent（集計情報）
+ M --> B : 分析結果またはエラー
+ B -> B : 成功時のみキャッシュ保存
+ else キャッシュ有効
+ B -> B : 保存済み分析取得
+ else 検証・制限エラー
+ B -> B : エラー処理
+ end
+ B --> F : 分析結果またはエラー
+ deactivate B
+else 未認証・不正要求
+ F -> F : 拒否応答生成
+end
+F --> N : JSON
+ deactivate F
+N --> U : 分析結果またはエラー表示
+ deactivate N
+end
+group 06 ログアウト
+U -> N : GET /auth/logout
+N -> F : ログアウト要求
+activate F
+F -> F : アプリセッション破棄
+F --> N : Cookie削除・ログアウト先へリダイレクト
+ deactivate F
+N --> U : 302
+U -> A : Auth0ログアウト
+A --> U : 許可済みURLへリダイレクト
+end
+group 07 CI/CD・デプロイ予約
+U -> G : push / pull request / workflow_dispatch
+activate G
+alt Frontend
+ G -> G : npm ci / lint / typecheck / build
+else Backend
+ G -> G : Maven clean verify / JAR確認
+end
+alt CI成功・mainデプロイ対象
+ G -> G : 最新main SHA照合
+ alt 対象SHAが最新
+ G -> W : OIDC / STS AssumeRoleWithWebIdentity
+ W --> G : 一時認証情報
+ G -> W : PutParameter（対象のpending-sha）
+ W --> G : 登録結果
+ G -> W : DescribeInstances
+ W --> G : EC2状態
+ alt running かつ 08:00〜18:00未満 JST
+ G -> W : SSM SendCommand（CommitSha）
+ W -> E : カスタム文書・ログ付きデプロイ実行
+ E --> W : 実行受付
+ loop 終了までポーリング（上限あり）
+ G -> W : GetCommandInvocation
+ W --> G : 実行状態・結果
+ end
+ else 停止中・時間外
+ G -> G : デプロイ予約として終了
+ end
+ else 最新SHAではない
+ G -> G : 古いデプロイをスキップ
+ end
+else CI失敗・対象外
+ G -> G : デプロイしない
+end
+ deactivate G
+end
+group 08 EC2起動・停止と予約処理
+W -> E : Scheduler StartInstances（毎日08:00 JST）
+activate E
+E -> E : EC2 pending → running\nsystemdでBackend / Frontend / Nginx起動
+loop 起動2分後・前回処理終了15分後
+ E -> E : deploy-pending.sh / 時間帯確認
+ opt 08:00〜18:00未満
+ E -> W : GetParameter（backend / frontend pending-sha）
+ W --> E : 対象SHA（またはNONE）
+ E -> E : Backend HEAD・成功SHA・health確認
+ opt Backend未反映
+ E -> E : Backendデプロイ（次区間の共通処理）
+ end
+ alt Backend正常・終了コード0
+ E -> E : Frontend HEAD・成功SHA・health確認
+ opt Frontend未反映
+ E -> E : Frontendデプロイ（次区間の共通処理）
+ end
+ else Backend失敗・待機・上限
+ E -> E : Frontend延期
+ end
+ end
+end
+ deactivate E
+W -> E : Scheduler StopInstances（毎日20:00 JST）
+E -> E : stopping → stopped
+note over W,E : 停止中もEBS・Elastic IP等の費用は継続。\n強制停止中のデプロイ復旧は未検証。
+end
+group 09 共通デプロイ詳細（SSM / 予約処理から呼出）
+activate E
+E -> E : SHA形式検証・flock共通ロック取得（最大1800秒）
+alt ロック取得・時間内・現行成果物正常
+ E -> G : git fetch origin main
+ G --> E : リモート履歴
+ E -> E : clean tree・祖先関係・現行SHA・health確認
+ alt 同一SHAかつ正常稼働
+ E -> E : 重複実行をスキップ
+ else 更新候補
+ E -> W : GetParameter（最新pending SHA）
+ W --> E : 予約SHA
+ alt 対象SHA一致・前提条件成立
+ E -> E : retry state読込・新SHAなら初期化
+ alt 試行3回到達
+ E -> E : 終了コード76（上限）
+ else 前回開始から900秒未満
+ E -> E : 終了コード75（待機）
+ else 実行可能
+ E -> E : 試行回数・時刻を原子的に保存
+ alt Frontend
+ E -> E : .next / node_modulesバックアップ・比較検証
+ else Backend
+ E -> E : JARバックアップ・SHA256検証
+ end
+ alt バックアップ成功
+ E -> E : 対象systemdサービス停止\ngit reset --hard 対象SHA
+ alt Frontend
+ E -> E : npm ci / npm run build / BUILD_ID確認
+ else Backend
+ E -> E : mvn clean package -DskipTests / JAR確認
+ end
+ opt ビルド成功
+ E -> E : 対象サービス起動
+ loop ヘルスチェック（最大30回・成功時終了）
+ alt Frontend
+ E -> F : GET http://127.0.0.1:3000/
+ F --> E : HTTP応答
+ else Backend
+ E -> B : GET /api/v1/github/projects（8080）
+ B --> E : HTTP応答
+ end
+ end
+ end
+ alt ビルド・起動・health・状態保存成功
+ E -> E : 成功SHAを原子的に保存\nretry_success / 終了コード0
+ else デプロイ開始後の失敗
+ E -> E : 対象サービス停止・バックアップ検証\n旧SHAへreset・成果物復元
+ E -> E : サービス再起動・health確認
+ alt 復旧成功
+ E -> E : 旧成功SHA保存・試行情報維持
+ else 復旧失敗
+ E -> E : エラー記録・手動復旧が必要
+ end
+ E -> E : 非ゼロ終了
+ end
+ else バックアップ失敗
+ E -> E : 現行環境を維持・失敗終了
+ end
+ end
+ else 予約変更・前提不成立
+ E -> E : 実行せず終了
+ end
+ end
+else ロック・時間・前提条件エラー
+ E -> E : 実行せず終了
+end
+E -> E : ロック解放（取得済みの場合）
+E --> W : SSM経由の場合は終了コード・ログ返却
+ deactivate E
+opt 運用者によるリトライ解除
+ U -> E : reset-deploy-retry.sh component SHA
+ E -> E : 共通ロック・SHA照合・記録削除\n監査ログ出力（デプロイ自体は実行しない）
+ E --> U : 結果
+end
+end
+group 10 ログ・リソース監視
+F -> E : stdout / stderr → journald
+B -> E : stdout / stderr → journald
+N -> E : access.log / error.log
+E -> E : rsyslog・デプロイログ・logrotate
+loop Agent収集（メトリクス300秒・ログ随時）
+ E -> W : CloudWatch Logs / Metrics\nmem / disk / swap・アプリ・Nginx・デプロイログ
+ W -> W : EC2標準指標と合わせてAlarm評価
+ opt ALARM状態へ遷移
+ W -> W : SNS Publish
+ W --> U : メール通知
+ end
+end
+U -> W : Dashboard / Logs Insights
+W --> U : メトリクス・ログ検索結果
+end
+group 11 AWS料金監視
+W -> W : AWS Budgets 月額30 USD\n実績50/80/100%・予測100%を評価
+opt しきい値超過
+ W --> U : 予算通知メール
+end
+end
+note over U,E : 現行設計の概念統合図。Basic認証は予定。\nMySQL・Spring Security・RBACは未実装。\nログ機密情報対策、実通知、定時停止、強制停止復旧は残確認。
+@enduml

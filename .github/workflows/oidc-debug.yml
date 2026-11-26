@@ -1,0 +1,36 @@
+name: Backend OIDC Debug
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+
+    steps:
+      # OIDCトークンの認証情報を確認する
+      - name: Inspect OIDC claims
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const token = await core.getIDToken("sts.amazonaws.com");
+
+            const claims = JSON.parse(
+              Buffer.from(
+                token.split(".")[1],
+                "base64url"
+              ).toString("utf8")
+            );
+
+            console.log(JSON.stringify({
+              iss: claims.iss,
+              aud: claims.aud,
+              sub: claims.sub,
+              repository: claims.repository,
+              ref: claims.ref,
+              event_name: claims.event_name
+            }, null, 2));

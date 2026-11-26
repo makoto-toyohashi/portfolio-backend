@@ -1,0 +1,59 @@
+name: Backend CI
+
+# ========================================
+# 実行トリガー
+# ========================================
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# デフォルトの権限
+permissions:
+  contents: read
+
+jobs:
+  # ========================================
+  # CI：品質チェック
+  # ========================================
+  ci:
+    name: Backend CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ソースコードの取得
+      - name: Checkout source code
+        uses: actions/checkout@v5
+
+      # Java実行環境の構築
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      # Java・Mavenのバージョン確認
+      - name: Check environment
+        run: |
+          java -version
+          mvn -version
+
+      # コンパイル・テスト・ビルド
+      - name: Build and test
+        run: mvn --batch-mode clean verify
+
+      # JARファイルの生成確認
+      - name: Verify build artifact
+        run: |
+          test -s target/portfolio-backend-0.0.1-SNAPSHOT.jar
+
+      # ビルド成果物の保存
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolio-backend
+          path: target/portfolio-backend-0.0.1-SNAPSHOT.jar
+          retention-days: 7
+          if-no-files-found: error
